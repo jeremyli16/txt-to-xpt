@@ -2,7 +2,7 @@
 txt_to_xpt.py
 -------------
 Converts a delimited text file (millions of rows, hundreds of variables)
-to a SAS Transport (XPT) file that follows SAS Version 5 Transport conventions.
+to a SAS Transport (XPT) file that follows SAS Version 5 or 8 Transport conventions.
 
 Usage
 -----
@@ -28,11 +28,14 @@ Options
 --var-map FILE        Optional JSON file mapping column -> {name, label, format, type}
 --date-cols COL,...   Comma-separated column names to parse as SAS dates
 --missing-values V,.. Comma-separated string values treated as missing (default: .,NA,NaN,"")
+--no-header           Input has no header row; columns named COL1, COL2, ...
+--xpt-version N       XPT format version: 5 (default, 8-char names) or 8 (32-char names)
 
 SAS XPT Conventions Enforced
 -----------------------------
 - Dataset name    : uppercase, max 8 chars, starts with letter/underscore
-- Variable names  : uppercase, max 8 chars, starts with letter/underscore, alphanumeric+underscore
+- Variable names  : uppercase, max 8 chars (V5) or 32 chars (V8), starts with letter/underscore,
+                    alphanumeric+underscore
 - Variable labels : max 40 chars (truncated with warning)
 - Format names    : max 8 chars
 - Numeric columns : stored as 8-byte IEEE double (SAS default)
@@ -51,12 +54,10 @@ import os
 import re
 import struct
 import sys
-import warnings
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
 import pandas as pd
 
 # ---------------------------------------------------------------------------
@@ -74,18 +75,18 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 SAS_EPOCH = date(1960, 1, 1)
 SAS_EPOCH_DT = datetime(1960, 1, 1)
-MAX_NAME_LEN = 8
+MAX_NAME_LEN = 8          # SAS XPT V5
+MAX_NAME_LEN_V8 = 32      # SAS XPT V8
 MAX_LABEL_LEN = 40
 MAX_DATASET_NAME_LEN = 8
 MAX_CHAR_WIDTH = 200          # practical cap; SAS itself allows up to 32767
-XPT_VERSION = b"5"
 
 
-def _sas_name(raw: str, seen: set, kind: str = "variable") -> str:
+def _sas_name(raw: str, seen: set, kind: str = "variable", max_name_len: int = MAX_NAME_LEN) -> str:
     """
     Convert an arbitrary string to a valid SAS name:
       - uppercase
-      - max 8 characters
+      - max max_name_len characters
       - only letters, digits, underscores
       - must start with a letter or underscore
     Deduplicates by appending a numeric suffix.
@@ -96,17 +97,17 @@ def _sas_name(raw: str, seen: set, kind: str = "variable") -> str:
         name = "_" + name
     if not name:
         name = "VAR"
-    name = name[:MAX_NAME_LEN]
+    name = name[:max_name_len]
 
     base = name
     suffix = 1
     while name in seen:
         tail = str(suffix)
-        name = base[: MAX_NAME_LEN - len(tail)] + tail
+        name = base[:max_name_len - len(tail)] + tail
         suffix += 1
 
     seen.add(name)
-    if name != raw.upper()[:MAX_NAME_LEN]:
+    if name != raw.upper()[:max_name_len]:
         log.warning("  %s name '%s' → '%s'", kind, raw, name)
     return name
 
@@ -128,7 +129,7 @@ def _days_since_sas_epoch(val) -> Optional[float]:
 
 
 # ---------------------------------------------------------------------------
-# XPT writer (SAS Version 5 Transport format, pure Python)
+# XPT writer (SAS Version 5 and 8 Transport format, pure Python)
 # ---------------------------------------------------------------------------
 # Reference: SAS Technical Support TS-140 / SAS Institute documentation.
 
@@ -180,7 +181,7 @@ def _ieee_to_ibm(value: float) -> bytes:
 
 class XPTWriter:
     """
-    Writes a single-dataset SAS Version 5 XPT file.
+    Writes a single-dataset SAS Version 5 or 8 XPT file.
 
     Parameters
     ----------
@@ -188,17 +189,23 @@ class XPTWriter:
     dataset_name: SAS dataset name (≤8 uppercase chars)
     label       : dataset label (≤40 chars)
     variables   : list of dicts with keys:
-                    name   (str, ≤8), label (str, ≤40),
+                    name   (str, ≤8 or ≤32), label (str, ≤40),
                     type   ('N' or 'C'),
                     length (int; 8 for numeric, 1-200 for char),
                     format (str, ≤8, optional)
+    xpt_version : 5 (default, 8-char names) or 8 (32-char names)
     """
 
-    def __init__(self, path: str, dataset_name: str, label: str, variables: list):
+    def __init__(self, path: str, dataset_name: str, label: str, variables: list, xpt_version: int = 5):
         self.path = path
         self.dataset_name = _pad(dataset_name.encode("ascii", "replace"), 8)
         self.label = _pad(label.encode("ascii", "replace"), 40)
         self.variables = variables
+        self.xpt_version = xpt_version
+        # V5: nname=8 bytes, pad=52; V8: nname=32 bytes, pad=28 (both total 140 bytes)
+        self._name_field_len = MAX_NAME_LEN_V8 if xpt_version == 8 else MAX_NAME_LEN
+        self._namestr_pad = 28 if xpt_version == 8 else 52
+        self._version_byte = b"8" if xpt_version == 8 else b"5"
         self._fh = None
         self._obs_count = 0
         self._row_len = sum(v["length"] for v in variables)
@@ -224,7 +231,7 @@ class XPTWriter:
         time_str = _pad(now.strftime("%H:%M:%S").encode(), 8)
 
         rec1 = _pad(b"HEADER RECORD*******LIBRARY HEADER RECORD!!!!!!!000000000000000000000000000000", 80)
-        rec2 = _pad(b"SAS     SAS     SASLIB  " + XPT_VERSION + b"   " + b" " * 52, 80)
+        rec2 = _pad(b"SAS     SAS     SASLIB  " + self._version_byte + b"   " + b" " * 52, 80)
         rec3 = _pad(date_str + b" " * 8 + time_str + b" " * 16 + date_str + b" " * 32, 80)
 
         self._fh.write(rec1 + rec2 + rec3)
@@ -237,7 +244,7 @@ class XPTWriter:
 
         rec1 = _pad(b"HEADER RECORD*******MEMBER  HEADER RECORD!!!!!!!000000000000000001600000000140", 80)
         rec2 = _pad(b"HEADER RECORD*******DSCRPTR HEADER RECORD!!!!!!!000000000000000000000000000000", 80)
-        rec3 = _pad(b"SAS     " + self.dataset_name + b"SASDATA " + XPT_VERSION + b"   " + b" " * 52, 80)
+        rec3 = _pad(b"SAS     " + self.dataset_name + b"SASDATA " + self._version_byte + b"   " + b" " * 52, 80)
         # modified(16) + _(16) + label(40) + type(8) = 80  — layout pandas expects
         rec4 = _pad(modified + b" " * 16 + self.label + b" " * 8, 80)
 
@@ -258,21 +265,21 @@ class XPTWriter:
         for i, var in enumerate(self.variables, start=1):
             ntype = 1 if var["type"] == "N" else 2
             length = var["length"]
-            name = _pad(var["sas_name"].encode("ascii", "replace"), 8)
+            name = _pad(var["sas_name"].encode("ascii", "replace"), self._name_field_len)
             label = _pad(var["label"].encode("ascii", "replace"), 40)
             fmt = _pad(var.get("format", "").encode("ascii", "replace"), 8)
             infmt = _pad(var.get("informat", "").encode("ascii", "replace"), 8)
 
             # XPT NAMESTR: 140 bytes big-endian
-            # ntype(2) nhfun(2) nlng(2) nvar0(2) nname(8) nlabel(40)
-            # nform(8) nfl(2) nfd(2) nfj(2) nfill(2) niform(8)
-            # nifl(2) nifd(2) npos(4) pad(52) = 140
+            # V5: ntype(2) nhfun(2) nlng(2) nvar0(2) nname(8)  nlabel(40) nform(8) nfl(2) nfd(2)
+            #     nfj(2) nfill(2) niform(8) nifl(2) nifd(2) npos(4) pad(52) = 140
+            # V8: same layout but nname(32) and pad(28) = 140
             ns = (
                 struct.pack(">h", ntype)    # 2  ntype
                 + struct.pack(">h", 0)      # 2  nhfun
                 + struct.pack(">h", length) # 2  nlng
                 + struct.pack(">h", i)      # 2  nvar0
-                + name                      # 8  nname
+                + name                      # 8 or 32  nname
                 + label                     # 40 nlabel
                 + fmt                       # 8  nform
                 + struct.pack(">h", 0)      # 2  nfl
@@ -283,7 +290,7 @@ class XPTWriter:
                 + struct.pack(">h", 0)      # 2  nifl
                 + struct.pack(">h", 0)      # 2  nifd
                 + struct.pack(">l", pos)    # 4  npos
-                + b"\x00" * 52             # 52 padding
+                + b"\x00" * self._namestr_pad  # 52 (V5) or 28 (V8) padding
             )
             assert len(ns) == 140, f"Namestr length {len(ns)} != 140"
             namestr_bytes += ns
@@ -361,12 +368,15 @@ def _infer_schema(
     missing_values: list,
     date_cols: list,
     var_map: dict,
+    has_header: bool = True,
+    max_name_len: int = MAX_NAME_LEN,
 ) -> dict:
     """
     Returns a dict:
         col_original -> {sas_name, label, type, length, format, informat}
     """
     log.info("Schema inference pass (first %d rows)…", chunksize)
+    read_kwargs = {} if has_header else {"header": None}
     sample = pd.read_csv(
         path,
         sep=delimiter,
@@ -375,7 +385,10 @@ def _infer_schema(
         na_values=missing_values,
         keep_default_na=True,
         low_memory=False,
+        **read_kwargs,
     )
+    if not has_header:
+        sample.columns = [f"COL{i + 1}" for i in range(len(sample.columns))]
 
     seen_names: set = set()
     schema = {}
@@ -383,7 +396,7 @@ def _infer_schema(
     for col in sample.columns:
         override = var_map.get(col, {})
         raw_name = override.get("name", col)
-        sas_name = _sas_name(raw_name, seen_names)
+        sas_name = _sas_name(raw_name, seen_names, max_name_len=max_name_len)
         label = _sas_label(override.get("label", col))
         fmt = override.get("format", "")
         infmt = override.get("informat", "")
@@ -440,6 +453,7 @@ def _scan_char_widths(
     chunksize: int,
     missing_values: list,
     schema: dict,
+    has_header: bool = True,
 ) -> None:
     """Update character variable lengths by scanning the entire file."""
     char_cols = [col for col, v in schema.items() if v["type"] == "C"]
@@ -447,17 +461,38 @@ def _scan_char_widths(
         return
 
     log.info("Scanning full file for max character widths…")
-    reader = pd.read_csv(
-        path,
-        sep=delimiter,
-        encoding=encoding,
-        usecols=char_cols,
-        chunksize=chunksize,
-        na_values=missing_values,
-        keep_default_na=True,
-        low_memory=False,
-    )
+
+    if has_header:
+        reader = pd.read_csv(
+            path,
+            sep=delimiter,
+            encoding=encoding,
+            usecols=char_cols,
+            chunksize=chunksize,
+            na_values=missing_values,
+            keep_default_na=True,
+            low_memory=False,
+        )
+        col_rename = None
+    else:
+        all_cols = list(schema.keys())
+        col_indices = [all_cols.index(c) for c in char_cols]
+        reader = pd.read_csv(
+            path,
+            sep=delimiter,
+            encoding=encoding,
+            usecols=col_indices,
+            chunksize=chunksize,
+            na_values=missing_values,
+            keep_default_na=True,
+            low_memory=False,
+            header=None,
+        )
+        col_rename = dict(zip(col_indices, char_cols))
+
     for chunk in reader:
+        if col_rename:
+            chunk = chunk.rename(columns=col_rename)
         for col in char_cols:
             if col in chunk.columns:
                 mx = chunk[col].dropna().astype(str).str.len().max()
@@ -473,6 +508,12 @@ def convert(args):
     delimiter = args.delimiter or _detect_delimiter(args.input, args.encoding)
     missing_values = [v for v in (args.missing_values or ".,NA,NaN,").split(",")]
     date_cols = [c.strip() for c in (args.date_cols or "").split(",") if c.strip()]
+
+    has_header = not args.no_header
+    max_name_len = MAX_NAME_LEN_V8 if args.xpt_version == 8 else MAX_NAME_LEN
+
+    if not has_header:
+        log.info("No-header mode: columns will be named COL1, COL2, …")
 
     # Load optional variable map
     var_map = {}
@@ -493,12 +534,14 @@ def convert(args):
     schema = _infer_schema(
         args.input, delimiter, args.encoding,
         args.chunksize, missing_values, date_cols, var_map,
+        has_header=has_header, max_name_len=max_name_len,
     )
 
     # Full-file width scan for character variables
     _scan_char_widths(
         args.input, delimiter, args.encoding,
         args.chunksize, missing_values, schema,
+        has_header=has_header,
     )
 
     variables = list(schema.values())   # ordered as in file
@@ -508,9 +551,11 @@ def convert(args):
     log.info("Row byte length: %d", row_len)
 
     # Write XPT
-    log.info("Writing XPT: %s (dataset=%s, label=%r)", args.output, dataset_name, label)
-    with XPTWriter(args.output, dataset_name, label, variables) as writer:
+    log.info("Writing XPT: %s (dataset=%s, label=%r, xpt_version=%d)",
+             args.output, dataset_name, label, args.xpt_version)
+    with XPTWriter(args.output, dataset_name, label, variables, xpt_version=args.xpt_version) as writer:
         parse_dates_arg = date_cols if date_cols else False
+        read_kwargs = {} if has_header else {"header": None}
         reader = pd.read_csv(
             args.input,
             sep=delimiter,
@@ -520,10 +565,14 @@ def convert(args):
             keep_default_na=True,
             low_memory=False,
             parse_dates=parse_dates_arg if parse_dates_arg else False,
+            **read_kwargs,
         )
 
         chunk_num = 0
         for chunk in reader:
+            if not has_header:
+                chunk.columns = [f"COL{i + 1}" for i in range(len(chunk.columns))]
+
             chunk_num += 1
             if chunk_num % 10 == 0:
                 log.info("  Processing chunk %d (~%d rows so far)…",
@@ -553,13 +602,16 @@ def convert(args):
     print("\n=== Conversion Summary ===")
     print(f"  Input         : {args.input}")
     print(f"  Output        : {args.output}  ({size_mb:.1f} MB)")
+    print(f"  XPT version   : {args.xpt_version}")
+    print(f"  Has header    : {has_header}")
     print(f"  Dataset name  : {dataset_name}")
     print(f"  Variables     : {len(variables)}")
     print(f"  Observations  : {writer._obs_count:,}")
     print(f"  Row byte len  : {row_len}")
     print("\n  First 10 variables:")
+    name_width = max_name_len
     for v in variables[:10]:
-        print(f"    {v['sas_name']:<8}  {v['type']}  len={v['length']:<4}  label={v['label']!r}")
+        print(f"    {v['sas_name']:<{name_width}}  {v['type']}  len={v['length']:<4}  label={v['label']!r}")
     if len(variables) > 10:
         print(f"    … and {len(variables)-10} more")
 
@@ -583,6 +635,8 @@ def main():
     parser.add_argument("--var-map",       default=None,    help="JSON file with variable metadata")
     parser.add_argument("--date-cols",     default="",      help="Comma-separated date column names")
     parser.add_argument("--missing-values",default=".,NA,NaN,", help="Comma-separated missing value strings")
+    parser.add_argument("--no-header",     action="store_true", help="Input has no header row; columns named COL1, COL2, …")
+    parser.add_argument("--xpt-version",   default=5, type=int, choices=[5, 8], help="XPT format version: 5 (default, 8-char names) or 8 (32-char names)")
 
     args = parser.parse_args()
 
