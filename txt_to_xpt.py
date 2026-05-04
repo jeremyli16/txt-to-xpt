@@ -47,6 +47,7 @@ SAS XPT Conventions Enforced
 """
 
 import argparse
+import csv
 import json
 import logging
 import math
@@ -358,6 +359,21 @@ def _detect_delimiter(path: str, encoding: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Auto-detect header
+# ---------------------------------------------------------------------------
+def _detect_header(path: str, delimiter: str, encoding: str) -> bool:
+    """Use csv.Sniffer to guess whether the first row is a header."""
+    with open(path, encoding=encoding, errors="replace") as fh:
+        sample = fh.read(8192)
+    try:
+        result = csv.Sniffer().has_header(sample)
+    except csv.Error:
+        result = True  # default to header-present when indeterminate
+    log.info("Auto-detected header: %s", result)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Schema inference pass (first chunksize rows)
 # ---------------------------------------------------------------------------
 def _infer_schema(
@@ -509,7 +525,11 @@ def convert(args):
     missing_values = [v for v in (args.missing_values or ".,NA,NaN,").split(",")]
     date_cols = [c.strip() for c in (args.date_cols or "").split(",") if c.strip()]
 
-    has_header = not args.no_header
+    if args.no_header:
+        has_header = False
+        log.info("Header mode: forced off via --no-header")
+    else:
+        has_header = _detect_header(args.input, delimiter, args.encoding)
     max_name_len = MAX_NAME_LEN_V8 if args.xpt_version == 8 else MAX_NAME_LEN
 
     if not has_header:
@@ -635,7 +655,7 @@ def main():
     parser.add_argument("--var-map",       default=None,    help="JSON file with variable metadata")
     parser.add_argument("--date-cols",     default="",      help="Comma-separated date column names")
     parser.add_argument("--missing-values",default=".,NA,NaN,", help="Comma-separated missing value strings")
-    parser.add_argument("--no-header",     action="store_true", help="Input has no header row; columns named COL1, COL2, …")
+    parser.add_argument("--no-header",     action="store_true", help="Force no-header mode (default: auto-detected via csv.Sniffer); columns named COL1, COL2, …")
     parser.add_argument("--xpt-version",   default=5, type=int, choices=[5, 8], help="XPT format version: 5 (default, 8-char names) or 8 (32-char names)")
 
     args = parser.parse_args()
